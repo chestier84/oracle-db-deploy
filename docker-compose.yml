@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  oracle-xe:
+    image: gvenzl/oracle-xe:21.3.0
+    container_name: oracle-xe-test
+    ports:
+      - "1521:1521"
+      - "5500:5500"
+    environment:
+      ORACLE_PASSWORD: Oracle123!
+      ORACLE_CHARACTERSET: AL32UTF8
+      ORACLE_EDITION: express
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD", "sqlplus", "-v"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - oracle-network
+
+  liquibase:
+    image: liquibase/liquibase:4.26.0
+    container_name: liquibase-runner
+    depends_on:
+      oracle-xe:
+        condition: service_healthy
+    environment:
+      LIQUIBASE_COMMAND: update
+      LIQUIBASE_DEFAULTS_FILE: /liquibase/liquibase.properties
+    volumes:
+      - ./liquibase:/liquibase
+      - ./scripts:/scripts
+    working_dir: /liquibase
+    networks:
+      - oracle-network
+    command: >
+      sh -c "
+        echo 'Waiting for Oracle to be ready...' &&
+        sleep 10 &&
+        liquibase status &&
+        liquibase update-sql
+      "
+
+volumes:
+  oracle-data:
+
+networks:
+  oracle-network:
+    driver: bridge

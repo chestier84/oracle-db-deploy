@@ -1,0 +1,194 @@
+stages:
+  - validate
+  - test
+  - deploy
+  - rollback
+
+variables:
+  DOCKER_IMAGE: "liquibase/liquibase:4.26.0"
+  SQLFLUFF_IMAGE: "sqlfluff/sqlfluff:latest"
+  ORACLE_XE_IMAGE: "gvenzl/oracle-xe:21.3.0"
+
+# Variables por entorno
+.prod_env: &prod_env
+  ENVIRONMENT: "production"
+  ORACLE_HOST: ${ORACLE_PROD_HOST}
+  ORACLE_PORT: ${ORACLE_PROD_PORT}
+  ORACLE_SID: ${ORACLE_PROD_SID}
+  ORACLE_USER: ${ORACLE_PROD_USER}
+  ORACLE_PASSWORD: ${ORACLE_PROD_PASSWORD}
+
+.staging_env: &staging_env
+  ENVIRONMENT: "staging"
+  ORACLE_HOST: ${ORACLE_STAGING_HOST}
+  ORACLE_PORT: ${ORACLE_STAGING_PORT}
+  ORACLE_SID: ${ORACLE_STAGING_SID}
+  ORACLE_USER: ${ORACLE_STAGING_USER}
+  ORACLE_PASSWORD: ${ORACLE_STAGING_PASSWORD}
+
+validate:lint:
+  stage: validate
+  image: ${SQLFLUFF_IMAGE}
+  script:
+    - echo "🔍 Running SQLFluff linter..."
+    - sqlfluff lint liquibase/changelog/ --dialect oracle --config .sqlfluff
+  only:
+    - merge_requests
+    - main
+    - develop
+  allow_failure: false
+
+validate:security:
+  stage: validate
+  image: python:3.11
+  script:
+    - echo "🔒 Installing dependencies..."
+    - pip install sqlfluff sqlfluff[oracle]
+    - echo "🔍 Running security policy scan..."
+    - python3 scripts/security_scan.py liquibase/changelog/
+  artifacts:
+    reports:
+      security: security_report.json
+    expire_in: 30 days
+  only:
+    - merge_requests
+    - main
+    - develop
+  allow_failure: false
+
+validate:format:
+  stage: validate
+  image: ${SQLFLUFF_IMAGE}
+  script:
+    - echo "✓ Checking SQL formatting..."
+    - sqlfluff format liquibase/changelog/ --dialect oracle --config .sqlfluff --check
+  only:
+    - merge_requests
+    - main
+    - develop
+
+test:dry-run:staging:
+  stage: test
+  image: ${DOCKER_IMAGE}
+  services:
+    - name: ${ORACLE_XE_IMAGE}
+      alias: oracle-test
+      variables:
+        ORACLE_PASSWORD: "TestPass123!"
+  <<: *staging_env
+  script:
+    - echo "⏳ Waiting for Oracle XE to be ready..."
+    - for i in {1..30}; do
+        if nc -z oracle-test 1521 2>/dev/null; then
+          echo "✓ Oracle is ready";
+          break;
+        fi;
+        echo "Attempt $i: Waiting...";
+        sleep 2;
+      done
+    - echo "🔗 Testing Oracle connection with SQLcl..."
+    - |
+      echo "set echo on
+      exit;" | sqlplus -L admin/TestPass123!@oracle-test:1521/XE
+    - echo "🧪 Running Liquibase dry-run..."
+    - liquibase
+      --changeLogFile=liquibase/changelog/master.xml
+      --driver=oracle.jdbc.driver.OracleDriver
+      --url=jdbc:oracle:thin:@oracle-test:1521:XE
+      --username=admin
+      --password=TestPass123!
+      update-sql
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    expire_in: 1 hour
+  only:
+    - merge_requests
+    - develop
+  allow_failure: false
+
+deploy:staging:
+  stage: deploy
+  image: ${DOCKER_IMAGE}
+  <<: *staging_env
+  script:
+    - echo "📤 Executing Liquibase update on staging..."
+    - |
+      liquibase \
+        --changeLogFile=liquibase/changelog/master.xml \
+        --driver=oracle.jdbc.driver.OracleDriver \
+        --url=jdbc:oracle:thin:@${ORACLE_HOST}:${ORACLE_PORT}:${ORACLE_SID} \
+        --username=${ORACLE_USER} \
+        --password=${ORACLE_PASSWORD} \
+        update
+    - echo "✓ Staging deployment completed"
+  environment:
+    name: staging
+    url: https://staging-oracle.example.com
+  only:
+    - develop
+  when: manual
+  allow_failure: false
+
+deploy:production:
+  stage: deploy
+  image: ${DOCKER_IMAGE}
+  <<: *prod_env
+  script:
+    - echo "🔐 Setting up Oracle Wallet for TCPS connection..."
+    - |
+      if [ ! -z "${ORACLE_WALLET_B64}" ]; then
+        mkdir -p ~/.oracle
+        echo "${ORACLE_WALLET_B64}" | base64 -d > ~/.oracle/wallet.zip
+        unzip -o ~/.oracle/wallet.zip -d ~/.oracle/
+        export TNS_ADMIN=~/.oracle
+      fi
+    - echo "🔗 Validating connection to production Oracle instance..."
+    - echo "set echo on exit;" | sqlplus -L ${ORACLE_USER}/${ORACLE_PASSWORD}@${ORACLE_HOST}:${ORACLE_PORT}/${ORACLE_SID}
+    - echo "📤 Executing Liquibase update on production..."
+    - |
+      liquibase \
+        --changeLogFile=liquibase/changelog/master.xml \
+        --driver=oracle.jdbc.driver.OracleDriver \
+        --url=jdbc:oracle:thin:@${ORACLE_HOST}:${ORACLE_PORT}:${ORACLE_SID} \
+        --username=${ORACLE_USER} \
+        --password=${ORACLE_PASSWORD} \
+        update
+    - echo "✓ Production deployment completed at $(date)" | tee deployment.log
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    paths:
+      - deployment.log
+    expire_in: 90 days
+  environment:
+    name: production
+    url: https://prod-oracle.example.com
+    deployment_tier: production
+  only:
+    - main
+  when: manual
+  allow_failure: false
+
+rollback:production:
+  stage: rollback
+  image: ${DOCKER_IMAGE}
+  <<: *prod_env
+  script:
+    - echo "⚠️  Executing rollback on production..."
+    - |
+      liquibase \
+        --changeLogFile=liquibase/changelog/master.xml \
+        --driver=oracle.jdbc.driver.OracleDriver \
+        --url=jdbc:oracle:thin:@${ORACLE_HOST}:${ORACLE_PORT}:${ORACLE_SID} \
+        --username=${ORACLE_USER} \
+        --password=${ORACLE_PASSWORD} \
+        rollback-count ${ROLLBACK_CHANGESETS:-1}
+    - echo "✓ Rollback completed at $(date)"
+  environment:
+    name: production
+    action: rollback
+  when: manual
+  only:
+    - main
+  allow_failure: false

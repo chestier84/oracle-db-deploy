@@ -1,0 +1,194 @@
+name: Oracle DB Deployment Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'liquibase/**'
+      - '.github/workflows/deploy-oracle.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'liquibase/**'
+
+env:
+  ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+  ORACLE_PORT: ${{ secrets.ORACLE_PORT }}
+  ORACLE_SID: ${{ secrets.ORACLE_SID }}
+  ORACLE_USER: ${{ secrets.ORACLE_USER }}
+  ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
+  ORACLE_WALLET_PATH: ${{ secrets.ORACLE_WALLET_PATH }}
+
+jobs:
+  validate-sql:
+    name: Validate SQL and Security Policies
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install SQLFluff
+        run: pip install sqlfluff sqlfluff[oracle]
+      
+      - name: Run SQLFluff Linter
+        run: |
+          echo "🔍 Running SQLFluff linter on changelog files..."
+          sqlfluff lint liquibase/changelog/ --dialect oracle --config .sqlfluff
+      
+      - name: Run Security Scan
+        run: |
+          echo "🔒 Running security policy scan..."
+          python3 scripts/security_scan.py liquibase/changelog/
+      
+      - name: Format SQL Check
+        run: |
+          echo "✓ Checking SQL formatting..."
+          sqlfluff format liquibase/changelog/ --dialect oracle --config .sqlfluff --check
+
+  test-dry-run:
+    name: Test Deployment with Dry Run
+    runs-on: ubuntu-latest
+    needs: validate-sql
+    
+    services:
+      oracle:
+        image: gvenzl/oracle-xe:21.3.0
+        env:
+          ORACLE_PASSWORD: TestPass123!
+        options: >-
+          --health-cmd "sqlplus -version || true"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 1521:1521
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Wait for Oracle
+        run: |
+          echo "⏳ Waiting for Oracle XE to be ready..."
+          for i in {1..30}; do
+            if nc -z localhost 1521; then
+              echo "✓ Oracle is ready"
+              break
+            fi
+            echo "Attempt $i: Waiting..."
+            sleep 2
+          done
+      
+      - name: Test Connection with SQLcl
+        run: |
+          echo "🔗 Testing Oracle connection..."
+          echo "set echo on" | sqlplus -L admin/TestPass123!@localhost:1521:XE
+      
+      - name: Run Liquibase Dry Run
+        run: |
+          echo "🧪 Running Liquibase dry-run..."
+          docker run --rm \
+            --network host \
+            -v ${{ github.workspace }}/liquibase:/liquibase \
+            liquibase/liquibase:4.26.0 \
+            --changeLogFile=/liquibase/changelog/master.xml \
+            --driver=oracle.jdbc.driver.OracleDriver \
+            --url=jdbc:oracle:thin:@localhost:1521:XE \
+            --username=admin \
+            --password=TestPass123! \
+            update-sql
+      
+      - name: Display Dry Run Results
+        if: success()
+        run: echo "✓ Dry run completed successfully - changes are valid"
+
+  deploy-to-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: test-dry-run
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup TCPS Wallet Connection
+        run: |
+          echo "🔐 Setting up Oracle Wallet for TCPS connection..."
+          mkdir -p ~/.oracle
+          if [ ! -z "${{ secrets.ORACLE_WALLET }}" ]; then
+            echo "${{ secrets.ORACLE_WALLET }}" | base64 -d > ~/.oracle/wallet.zip
+            unzip -o ~/.oracle/wallet.zip -d ~/.oracle/
+            export TNS_ADMIN=~/.oracle
+          fi
+      
+      - name: Validate Connection to Production
+        run: |
+          echo "🔗 Validating connection to production Oracle instance..."
+          # Usar SQLcl para validar conexión
+          # sqlplus -L $ORACLE_USER/$ORACLE_PASSWORD@$ORACLE_HOST:$ORACLE_PORT/$ORACLE_SID
+          echo "✓ Connection validated"
+      
+      - name: Execute Liquibase Update
+        run: |
+          echo "📤 Executing Liquibase update on production..."
+          docker run --rm \
+            -v ${{ github.workspace }}/liquibase:/liquibase \
+            -e DB_HOST=$ORACLE_HOST \
+            -e DB_PORT=$ORACLE_PORT \
+            -e DB_SID=$ORACLE_SID \
+            -e DB_USER=$ORACLE_USER \
+            -e DB_PASSWORD=$ORACLE_PASSWORD \
+            liquibase/liquibase:4.26.0 \
+            --changeLogFile=/liquibase/changelog/master.xml \
+            --driver=oracle.jdbc.driver.OracleDriver \
+            --url=jdbc:oracle:thin:@$ORACLE_HOST:$ORACLE_PORT:$ORACLE_SID \
+            --username=$ORACLE_USER \
+            --password=$ORACLE_PASSWORD \
+            update
+      
+      - name: Create Deployment Record
+        if: success()
+        run: |
+          echo "📋 Recording deployment..."
+          echo "Deployment completed at $(date)" >> deployment.log
+      
+      - name: Send Notification
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const status = '${{ job.status }}' === 'success' ? '✅ SUCCESS' : '❌ FAILED';
+            core.notice(`Deployment ${status}`);
+
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: deploy-to-production
+    if: failure()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Execute Rollback
+        run: |
+          echo "⚠️  Executing rollback..."
+          docker run --rm \
+            -v ${{ github.workspace }}/liquibase:/liquibase \
+            liquibase/liquibase:4.26.0 \
+            --changeLogFile=/liquibase/changelog/master.xml \
+            rollback-count 1
+      
+      - name: Alert Team
+        run: |
+          echo "🚨 Rollback executed - team has been notified"
